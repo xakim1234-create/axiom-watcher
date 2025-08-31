@@ -1,0 +1,12 @@
+{
+  "name": "axiom-watcher",
+  "type": "module",
+  "version": "1.0.0",
+  "dependencies": {
+    "node-fetch": "^3.3.2",
+    "puppeteer": "^24.10.0"
+  },
+  "scripts": {
+    "start": "node index.js"
+  }
+}
