@@ -3,80 +3,76 @@ import fetch from "node-fetch";
 
 const PAGE_URL = process.env.PAGE_URL || "https://axiom.trade/pulse";
 const CDN_HOST = process.env.CDN_HOST || "axiomtrading.sfo3.cdn.digitaloceanspaces.com";
-const API_URL  = process.env.API_URL;
+const API_URL = process.env.API_URL;
 const BATCH_MS = +(process.env.BATCH_MS || 5000);
 
-if (!API_URL) { console.error("Set API_URL env"); process.exit(1); }
+if (!API_URL) {
+  console.error("❌ Set API_URL env (your Vercel endpoint)");
+  process.exit(1);
+}
 
 const queue = new Set();
 const seenReq = new Set();
 
-const execPath = puppeteer.executablePath(); // <-- важное
-
 function extractMintFromUrl(u) {
-  const last = u.split("/").pop().split("?")[0].split("#")[0];
-  const dot = last.indexOf(".");
-  return dot === -1 ? last : last.slice(0, dot);
+  try {
+    const last = u.split("/").pop().split("?")[0].split("#")[0];
+    const dot = last.indexOf(".");
+    return dot === -1 ? last : last.slice(0, dot);
+  } catch {
+    return null;
+  }
 }
 
 async function flush() {
-  if (!queue.size) return;
-  const mints = [...queue]; queue.clear();
+  if (queue.size === 0) return;
+  const mints = Array.from(queue);
+  queue.clear();
   try {
-    const r = await fetch(API_URL, {
+    await fetch(API_URL, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mints })
     });
-    const js = await r.json().catch(()=>({}));
-    console.log(`[FLUSH] sent=${mints.length} status=${r.status} ok=${js.ok}`);
+    console.log("✅ Flushed mints:", mints);
   } catch (e) {
-    console.error("[FLUSH] failed:", e);
-    mints.forEach(m => queue.add(m));
+    console.error("❌ Failed to flush:", e);
   }
 }
 
 async function run() {
-  while (true) {
-    let browser;
-    try {
-      browser = await puppeteer.launch({
-        headless: "new",
-        executablePath: execPath,              // <-- важное
-        args: ["--no-sandbox", "--disable-setuid-sandbox"]
-      });
-      const page = await browser.newPage();
+  console.log("🚀 Launching watcher...");
 
-      page.on("requestfinished", req => {
-        try {
-          const u = new URL(req.url());
-          if (u.hostname !== CDN_HOST) return;
-          if (!u.pathname.endsWith("pump.webp")) return;
-          const full = u.toString();
-          if (seenReq.has(full)) return;
-          seenReq.add(full);
+  const browser = await puppeteer.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
 
-          const mint = extractMintFromUrl(full);
-          if (mint && !queue.has(mint)) {
-            queue.add(mint);
-            console.log("[NEW CA]", mint);
-          }
-        } catch {}
-      });
+  const page = await browser.newPage();
+  await page.setRequestInterception(true);
 
-      await page.goto(PAGE_URL, { waitUntil: "domcontentloaded" });
-      console.log("Watcher opened:", PAGE_URL);
+  page.on("request", (req) => {
+    const url = req.url();
+    if (seenReq.has(url)) return req.continue();
+    seenReq.add(url);
 
-      setInterval(flush, BATCH_MS);
-      await new Promise(()=>{});
-    } catch (e) {
-      console.error("Watcher error, restart in 5s:", e);
-      await new Promise(r => setTimeout(r, 5000));
-    } finally {
-      try { await flush(); } catch {}
-      try { await browser?.close(); } catch {}
+    if (url.includes(CDN_HOST)) {
+      const mint = extractMintFromUrl(url);
+      if (mint) {
+        console.log("👀 Found mint:", mint);
+        queue.add(mint);
+      }
     }
-  }
+
+    req.continue();
+  });
+
+  await page.goto(PAGE_URL, { waitUntil: "networkidle2" });
+
+  setInterval(flush, BATCH_MS);
 }
 
-run();
+run().catch((err) => {
+  console.error("Watcher error, restart in 5s:", err);
+  setTimeout(run, 5000);
+});
