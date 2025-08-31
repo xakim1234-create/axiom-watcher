@@ -1,9 +1,9 @@
-import puppeteer, { executablePath } from "puppeteer";
+import puppeteer, { executablePath as ppExecPath } from "puppeteer";
 import fetch from "node-fetch";
 
 const PAGE_URL = process.env.PAGE_URL || "https://axiom.trade/pulse";
 const CDN_HOST = process.env.CDN_HOST || "axiomtrading.sfo3.cdn.digitaloceanspaces.com";
-const API_URL = process.env.API_URL;
+const API_URL  = process.env.API_URL;
 const BATCH_MS = +(process.env.BATCH_MS || 5000);
 
 if (!API_URL) {
@@ -37,15 +37,22 @@ async function flush() {
     console.log("✅ Flushed mints:", mints);
   } catch (e) {
     console.error("❌ Failed to flush:", e);
+    // вернуть в очередь, чтобы не потерять
+    mints.forEach(m => queue.add(m));
   }
 }
 
 async function run() {
   console.log("🚀 Launching watcher...");
 
+  const execPath =
+    process.env.PUPPETEER_EXECUTABLE_PATH && process.env.PUPPETEER_EXECUTABLE_PATH.trim().length
+      ? process.env.PUPPETEER_EXECUTABLE_PATH
+      : ppExecPath();
+
   const browser = await puppeteer.launch({
     headless: true,
-    executablePath: executablePath(),   // 👈 явный путь до Chrome
+    executablePath: execPath,
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
@@ -58,22 +65,26 @@ async function run() {
   await page.setRequestInterception(true);
 
   page.on("request", (req) => {
-    const url = req.url();
-    if (seenReq.has(url)) return req.continue();
-    seenReq.add(url);
+    try {
+      const url = req.url();
+      if (seenReq.has(url)) return req.continue();
+      seenReq.add(url);
 
-    if (url.includes(CDN_HOST)) {
-      const mint = extractMintFromUrl(url);
-      if (mint) {
-        console.log("👀 Found mint:", mint);
-        queue.add(mint);
+      // фильтруем по CDN и маске файла
+      if (url.includes(CDN_HOST) && url.endsWith("pump.webp")) {
+        const mint = extractMintFromUrl(url);
+        if (mint) {
+          console.log("👀 Found mint:", mint);
+          queue.add(mint);
+        }
       }
+      req.continue();
+    } catch {
+      try { req.continue(); } catch {}
     }
-
-    req.continue();
   });
 
-  await page.goto(PAGE_URL, { waitUntil: "networkidle2" });
+  await page.goto(PAGE_URL, { waitUntil: "domcontentloaded" });
 
   setInterval(flush, BATCH_MS);
 }
