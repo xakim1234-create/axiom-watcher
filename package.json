@@ -1,13 +1,13 @@
 {
   "name": "axiom-watcher",
-  "type": "module",
   "version": "1.0.0",
-  "dependencies": {
-    "node-fetch": "^3.3.2",
-    "puppeteer": "^24.10.0"
-  },
+  "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "postinstall": "npx puppeteer browsers install chrome"
+    "postinstall": "npx puppeteer browsers install chromium"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2",
+    "puppeteer": "^23.0.2"
   }
 }
