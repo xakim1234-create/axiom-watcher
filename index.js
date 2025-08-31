@@ -1,130 +1,123 @@
-// index.js
 import puppeteer from "puppeteer";
 import fetch from "node-fetch";
 
-// ====== CONFIG ======
-const PAGE_URL  = process.env.PAGE_URL  || "https://axiom.trade/pulse";
-const CDN_HOST  = process.env.CDN_HOST  || "axiomtrading.sfo3.cdn.digitaloceanspaces.com";
-const API_URL   = process.env.API_URL;                 // ваш Vercel /api/mints
-const BATCH_MS  = +(process.env.BATCH_MS || 5000);     // период отправки
-const CHROME    = "/opt/render/.cache/puppeteer/chrome/linux-131.0.6778.204/chrome-linux64/chrome";
+/** ====== CONFIG ====== */
+const PAGE_URL = process.env.PAGE_URL || "https://axiom.trade/pulse";
+const CDN_HOST =
+  process.env.CDN_HOST || "axiomtrading.sfo3.cdn.digitaloceanspaces.com";
+const API_URL = process.env.API_URL;
+const BATCH_MS = +(process.env.BATCH_MS || 5000);
 
-// ====== GUARDS ======
+// Хром, установленный на Render (пусть остаётся дефолт, можно переопределять env-ом)
+const EXEC_PATH =
+  process.env.PUPPETEER_EXECUTABLE_PATH ||
+  "/opt/render/.cache/puppeteer/chrome/linux-131.0.6778.204/chrome-linux64/chrome";
+
+/** ====== GUARDS ====== */
 if (!API_URL) {
   console.error("❌ Set API_URL env (your Vercel endpoint)");
   process.exit(1);
 }
 
-// ====== STATE ======
-const queue   = new Set();
-const seenReq = new Set();
-
-// ====== UTILS ======
+/** ====== UTILS ====== */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function extractMintFromUrl(u) {
+/** Достаём mint из URL webp-картинки на CDN */
+function extractMintFromCdnPath(u) {
   try {
-    const last = u.split("/").pop().split("?")[0].split("#")[0];
-    const dot  = last.indexOf(".");
-    return dot === -1 ? last : last.slice(0, dot);
+    const url = new URL(u);
+    if (!url.host.includes(CDN_HOST)) return null;
+    if (!url.pathname.endsWith(".webp")) return null;
+
+    const base = url.pathname.split("/").pop(); // пример: 24tBK...pump.webp  или  O_pfp.webp
+
+    // 1) <mint>pump.webp
+    const m1 = base.match(/^([A-Za-z0-9]{32,})pump\.webp$/);
+    if (m1) return m1[1];
+
+    // 2) <mint>npump.webp
+    const m2 = base.match(/^([A-Za-z0-9]{32,})npump\.webp$/);
+    if (m2) return m2[1];
+
+    // 3) *_pfp.webp — игнорим (аватарки)
+    if (/_pfp\.webp$/.test(base)) return null;
+
+    // На всякий случай: всё, что перед "pump.webp"
+    const i = base.indexOf("pump.webp");
+    if (i > 0) {
+      const maybe = base.slice(0, i);
+      if (/^[A-Za-z0-9]{32,}$/.test(maybe)) return maybe;
+    }
+
+    return null;
   } catch {
     return null;
   }
 }
+
+/** ====== QUEUE & FLUSH ====== */
+const queue = new Set();
+const seenReq = new Set();
 
 async function flush() {
   if (queue.size === 0) return;
   const mints = Array.from(queue);
   queue.clear();
   try {
-    const r = await fetch(API_URL, {
+    await fetch(API_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mints }),
     });
-    console.log(`✅ Flushed mints: ${mints.length} → status=${r.status}`);
+    console.log("✅ Flushed mints:", mints);
   } catch (e) {
     console.error("❌ Failed to flush:", e);
-    // вернём назад, чтобы не потерять
-    mints.forEach(m => queue.add(m));
   }
 }
 
+/** ====== ROBUST GOTO ====== */
 async function gotoWithRetries(page, url, tries = 3) {
   for (let i = 1; i <= tries; i++) {
     try {
       console.log(`🌐 goto attempt ${i}/${tries}: ${url}`);
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 120_000 });
-      await sleep(1500); // заменили page.waitForTimeout
+      await page.goto(url, {
+        waitUntil: ["domcontentloaded", "networkidle2"],
+        timeout: 45_000,
+      });
+      await sleep(1500); // даём подгрузиться картинкам
       return;
     } catch (e) {
-      console.warn(`⚠️ goto failed (${i}/${tries}):`, e?.message || e);
+      console.warn(`⚠️ goto failed (${i}/${tries}): ${e.message}`);
       if (i === tries) throw e;
-      await sleep(1500);
+      await sleep(2000);
     }
   }
 }
 
-function normalizeCookies(raw) {
-  // гарантируем .axiom.trade, secure и sane значения
-  return raw.map(c => {
-    const domain = (c.domain || "axiom.trade").replace(/^https?:\/\//, "");
-    const needsDot = !domain.startsWith(".");
-    return {
-      path: "/",
-      sameSite: c.sameSite || "Lax",
-      secure: true,
-      httpOnly: !!c.httpOnly,
-      ...c,
-      domain: needsDot ? `.${domain}` : domain, // 👈 важная точка перед axiom.trade
-    };
-  });
-}
-
-// ====== MAIN ======
+/** ====== MAIN ====== */
 async function run() {
   console.log("🚀 Launching watcher...");
 
   const browser = await puppeteer.launch({
     headless: true,
-    executablePath: CHROME,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage", // важно для Render
-      "--no-zygote",
-      "--single-process",
-    ],
+    executablePath: EXEC_PATH,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
   });
 
   const page = await browser.newPage();
-  page.setDefaultNavigationTimeout(120_000);
-  page.setDefaultTimeout(120_000);
-  await page.setCacheEnabled(false);
 
-  // логи страницы
-  page.on("console", (msg) => {
-    try { console.log(`🖥️ page: ${msg.type()} ${msg.text()}`); } catch {}
-  });
-  page.on("pageerror", (err) => console.error("🖥️ pageerror:", err));
-
-  // user agent и размер
+  // user-agent/viewport ближе к твоим локальным условиям
   await page.setUserAgent(
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131 Safari/537.36"
   );
-  await page.setViewport({ width: 1366, height: 768 });
+  await page.setViewport({ width: 1366, height: 900, deviceScaleFactor: 1 });
 
-  // ⬇️ КУКИ ИЗ ENV (+ Authorization заголовок)
-  let accessToken = "";
+  // Куки с ENV (AXIOM_COOKIES) — JSON-массив
   try {
     if (process.env.AXIOM_COOKIES) {
-      const cookiesRaw = JSON.parse(process.env.AXIOM_COOKIES);
-      const cookies = normalizeCookies(cookiesRaw);
+      const cookies = JSON.parse(process.env.AXIOM_COOKIES);
       await page.setCookie(...cookies);
-      console.log(`🍪 Injected ${cookies.length} cookies for .axiom.trade`);
-
-      const access = cookies.find(c => c.name === "auth-access-token");
-      if (access?.value) accessToken = access.value;
+      console.log(`🍪 Injected ${cookies.length} cookies for axiom.trade`);
     } else {
       console.warn("⚠️ No AXIOM_COOKIES provided, login may fail");
     }
@@ -132,59 +125,45 @@ async function run() {
     console.error("❌ Failed to load cookies:", err);
   }
 
-  if (accessToken) {
-    await page.setExtraHTTPHeaders({
-      "Authorization": `Bearer ${accessToken}`
-    });
-  }
-
-  // перехват запросов → выдёргиваем CA из URL
+  // Ловим все запросы, но извлекаем только .webp с CDN
   await page.setRequestInterception(true);
   page.on("request", (req) => {
     const url = req.url();
     if (seenReq.has(url)) return req.continue();
     seenReq.add(url);
 
-    // лог WS для отладки
-    if (url.startsWith("wss://") || url.startsWith("ws://")) {
-      console.log("🔌 WS:", url);
-    }
-
-    if (url.includes(CDN_HOST) && url.endsWith("pump.webp")) {
-      const mint = extractMintFromUrl(url);
-      if (mint) {
-        console.log("👀 NEW CA:", mint);
+    const mint = extractMintFromCdnPath(url);
+    if (mint) {
+      if (!queue.has(mint)) {
         queue.add(mint);
+        console.log("👀 Found mint:", mint, "from", url);
       }
     }
-
     req.continue();
   });
 
+  // немножко логов со страницы — полезно в трейбле
+  page.on("console", (msg) =>
+    console.log("🖥️ page:", msg.type(), msg.text?.() ?? msg.text())
+  );
+  page.on("pageerror", (err) => console.log("🖥️ pageerror:", err.message));
+
   await gotoWithRetries(page, PAGE_URL, 3);
 
-  try {
-    await page.waitForSelector("body", { timeout: 30_000 });
-    console.log("🟢 Page ready (body present). Watching…");
-  } catch {
-    console.warn("⚠️ body selector not confirmed — продолжаем наблюдать");
-  }
-
-  // лёгкий автоскролл, чтобы триггерить lazy/обновления
+  // Автоскролл, чтобы подгружались новые карточки и их картинки
   setInterval(async () => {
     try {
-      await page.evaluate(() => {
-        window.scrollBy(0, 500);
-        setTimeout(() => window.scrollTo(0, 0), 400);
-      });
-    } catch {}
-  }, 5_000);
+      await page.evaluate(() => window.scrollBy(0, 900));
+      await sleep(800);
+    } catch (e) {
+      console.warn("scroll error:", e.message);
+    }
+  }, 3500);
 
-  // периодическая отправка
+  // Периодическая отправка
   setInterval(flush, BATCH_MS);
 }
 
-// автоперезапуск на ошибках
 run().catch((err) => {
   console.error("Watcher error, restart in 5s:", err);
   setTimeout(run, 5000);
