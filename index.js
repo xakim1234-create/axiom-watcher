@@ -1,4 +1,4 @@
-import puppeteer from "puppeteer";
+import puppeteer, { executablePath } from "puppeteer";
 import fetch from "node-fetch";
 
 const PAGE_URL = process.env.PAGE_URL || "https://axiom.trade/pulse";
@@ -32,7 +32,7 @@ async function flush() {
     await fetch(API_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mints })
+      body: JSON.stringify({ mints }),
     });
     console.log("✅ Flushed mints:", mints);
   } catch (e) {
@@ -45,7 +45,13 @@ async function run() {
 
   const browser = await puppeteer.launch({
     headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+    executablePath: executablePath(),   // 👈 явный путь до Chrome
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+    ],
   });
 
   const page = await browser.newPage();
