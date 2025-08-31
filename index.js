@@ -7,7 +7,7 @@ const API_URL  = process.env.API_URL;
 const BATCH_MS = +(process.env.BATCH_MS || 5000);
 
 if (!API_URL) {
-  console.error("❌ Set API_URL env (your Vercel endpoint)");
+  console.error("❌ Set API_URL env (your Vercel endpoint)"); 
   process.exit(1);
 }
 
@@ -18,7 +18,7 @@ function extractMintFromUrl(u) {
   try {
     const last = u.split("/").pop().split("?")[0].split("#")[0];
     const dot = last.indexOf(".");
-    return dot === -1 ? last : last.slice(0, dot);
+    return dot === -1 ? last : last.slice(0, dot); // всё между / и первой .
   } catch {
     return null;
   }
@@ -29,26 +29,23 @@ async function flush() {
   const mints = Array.from(queue);
   queue.clear();
   try {
-    await fetch(API_URL, {
+    const r = await fetch(API_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mints }),
     });
-    console.log("✅ Flushed mints:", mints);
+    console.log(`✅ FLUSH sent=${mints.length} status=${r.status}`);
   } catch (e) {
-    console.error("❌ Failed to flush:", e);
-    // вернуть в очередь, чтобы не потерять
-    mints.forEach(m => queue.add(m));
+    console.error("❌ FLUSH failed, requeue:", e);
+    mints.forEach(m => queue.add(m)); // вернём обратно — не теряем
   }
 }
 
-async function run() {
-  console.log("🚀 Launching watcher...");
+async function runOnce() {
+  const execPathEnv = (process.env.PUPPETEER_EXECUTABLE_PATH || "").trim();
+  const execPath = execPathEnv || ppExecPath();
 
-  const execPath =
-    process.env.PUPPETEER_EXECUTABLE_PATH && process.env.PUPPETEER_EXECUTABLE_PATH.trim().length
-      ? process.env.PUPPETEER_EXECUTABLE_PATH
-      : ppExecPath();
+  console.log("🧭 Using Chrome at:", execPath);
 
   const browser = await puppeteer.launch({
     headless: true,
@@ -62,34 +59,57 @@ async function run() {
   });
 
   const page = await browser.newPage();
-  await page.setRequestInterception(true);
 
-  page.on("request", (req) => {
+  // ловим завершённые запросы и фильтруем CDN + mask pump.webp
+  page.on("requestfinished", req => {
     try {
       const url = req.url();
-      if (seenReq.has(url)) return req.continue();
+      if (!url.includes(CDN_HOST)) return;
+      if (!url.endsWith("pump.webp")) return;
+      if (seenReq.has(url)) return;
       seenReq.add(url);
 
-      // фильтруем по CDN и маске файла
-      if (url.includes(CDN_HOST) && url.endsWith("pump.webp")) {
-        const mint = extractMintFromUrl(url);
-        if (mint) {
-          console.log("👀 Found mint:", mint);
-          queue.add(mint);
-        }
+      const mint = extractMintFromUrl(url);
+      if (mint && !queue.has(mint)) {
+        queue.add(mint);
+        console.log("👀 NEW CA:", mint);
       }
-      req.continue();
-    } catch {
-      try { req.continue(); } catch {}
+    } catch (e) {
+      // просто игнор
     }
   });
 
   await page.goto(PAGE_URL, { waitUntil: "domcontentloaded" });
+  console.log("🟢 Watcher opened:", PAGE_URL);
 
-  setInterval(flush, BATCH_MS);
+  const timer = setInterval(flush, BATCH_MS);
+
+  // держим процесс живым, пока всё ок
+  await new Promise(() => {}); // никогда не resolve
+
+  // (теоретически не дойдём сюда, но на всякий случай)
+  clearInterval(timer);
+  await browser.close();
 }
 
-run().catch((err) => {
-  console.error("Watcher error, restart in 5s:", err);
-  setTimeout(run, 5000);
+async function main() {
+  console.log("🚀 Launching watcher...");
+  while (true) {
+    try {
+      await runOnce();
+    } catch (e) {
+      console.error("⚠️ Watcher error, restart in 5s:", e);
+      // небольшая пауза, чтобы не долбить перезапусками
+      await new Promise(r => setTimeout(r, 5000));
+    }
+  }
+}
+
+process.on("uncaughtException", err => {
+  console.error("UNCAUGHT", err);
 });
+process.on("unhandledRejection", err => {
+  console.error("UNHANDLED", err);
+});
+
+main();
