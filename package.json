@@ -1,13 +1,14 @@
 {
   "name": "axiom-watcher",
   "version": "1.0.0",
-  "type": "module",
   "main": "index.js",
+  "type": "module",
   "scripts": {
-    "start": "npx puppeteer browsers install chrome --cache-dir=/opt/render/.cache/puppeteer || true && node index.js"
+    "start": "node index.js",
+    "postinstall": "echo skip-postinstall"
   },
   "dependencies": {
     "node-fetch": "^3.3.2",
-    "puppeteer": "^23.3.0"
+    "puppeteer-core": "^23.0.2"
   }
 }
