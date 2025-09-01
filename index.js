@@ -1,4 +1,4 @@
-// index.js — v2 с резервным WS и health-checks
+// index.js — v2.1: без дублей в логах, авто-переподключение и health-check
 import 'dotenv/config';
 import WebSocket from 'ws';
 import { Pool } from 'pg';
@@ -27,28 +27,25 @@ async function initDb() {
   console.log('DB ready');
 }
 
-// ——— извлечение CA из payload ———
+// ——— вытащить CA из payload ———
 function extractCA(obj) {
   if (!obj) return null;
 
-  // Явные поля
   for (const k of ['ca','contract','mint','mintAddress','tokenAddress','address','publicKey']) {
     const v = obj?.[k];
     if (typeof v === 'string' && v.endsWith('pump')) return v;
   }
 
-  // Из ссылки coin-image/<CA>/
-  const collect = [];
+  const urls = [];
   for (const k of ['image','image_url','imageUri','imageURI','img','thumb','logo','pic','icon']) {
-    if (typeof obj?.[k] === 'string') collect.push(obj[k]);
+    if (typeof obj?.[k] === 'string') urls.push(obj[k]);
   }
-  if (typeof obj?.metadata?.image === 'string') collect.push(obj.metadata.image);
-  for (const url of collect) {
-    const m = /\/coin-image\/([^/]+)\//.exec(url);
+  if (typeof obj?.metadata?.image === 'string') urls.push(obj.metadata.image);
+  for (const u of urls) {
+    const m = /\/coin-image\/([^/]+)\//.exec(u);
     if (m) return m[1];
   }
 
-  // Фолбэк: по сырому тексту
   const s = JSON.stringify(obj);
   let m = /\/coin-image\/([^/]+)\//.exec(s);
   if (m) return m[1];
@@ -58,6 +55,7 @@ function extractCA(obj) {
   return null;
 }
 
+// ——— сохраняем: лог только если это реально НОВАЯ запись ———
 async function saveToken(ca, payload) {
   const name = payload?.name ?? payload?.tokenName ?? null;
   const symbol = payload?.symbol ?? payload?.ticker ?? null;
@@ -65,34 +63,47 @@ async function saveToken(ca, payload) {
   const creator = payload?.creator ?? payload?.creatorAddress ?? payload?.owner ?? null;
   const ts = payload?.createdAt ?? payload?.timestamp ?? null;
 
-  await DB.query(
+  // 1) пытаемся вставить как новую строку
+  const ins = await DB.query(
     `insert into pump_tokens (ca,name,symbol,image_url,creator,first_seen_ts,raw)
      values ($1,$2,$3,$4,$5,$6,$7)
-     on conflict (ca) do update set
-       name = coalesce(EXCLUDED.name, pump_tokens.name),
-       symbol = coalesce(EXCLUDED.symbol, pump_tokens.symbol),
-       image_url = coalesce(EXCLUDED.image_url, pump_tokens.image_url),
-       creator = coalesce(EXCLUDED.creator, pump_tokens.creator),
-       first_seen_ts = coalesce(EXCLUDED.first_seen_ts, pump_tokens.first_seen_ts),
-       raw = coalesce(EXCLUDED.raw, pump_tokens.raw)`,
+     on conflict (ca) do nothing
+     returning ca`,
     [ca, name, symbol, image_url, creator, ts ? new Date(ts) : null, payload]
   );
-  stats.saved++;
-  stats.lastSavedAt = Date.now();
-  console.log('saved', ca, name || '', symbol || '');
+
+  if (ins.rowCount === 1) {
+    stats.saved++;
+    stats.lastSavedAt = Date.now();
+    console.log('saved NEW', ca, name || '', symbol || '');
+    return;
+  }
+
+  // 2) если уже было — просто дополним недостающие поля (тишина в логах)
+  await DB.query(
+    `update pump_tokens set
+        name = coalesce($2, name),
+        symbol = coalesce($3, symbol),
+        image_url = coalesce($4, image_url),
+        creator = coalesce($5, creator),
+        first_seen_ts = coalesce($6, first_seen_ts),
+        raw = coalesce($7, raw)
+     where ca = $1`,
+    [ca, name, symbol, image_url, creator, ts ? new Date(ts) : null, payload]
+  );
 }
 
-// ——— общие штуки для WS ———
+// ——— статистика/health ———
 const stats = { saved: 0, reconnects: 0, lastSavedAt: 0 };
 setInterval(() => {
-  const idleSec = ((Date.now() - (stats.lastSavedAt || Date.now()))/1000)|0;
+  const idleSec = ((Date.now() - (stats.lastSavedAt || Date.now()))/1000) | 0;
   console.log(`[stats] saved/min≈${stats.saved}  reconnects=${stats.reconnects}  idle=${idleSec}s`);
   stats.saved = 0;
 }, 60_000);
 
-// Сет локальных "увиденных" за последнюю сессию, чтобы не долбить БД при дублях от разных источников
+// локальная дедупликация (на случай двух сообщений подряд из одного WS)
 const seenInProcess = new Set();
-setInterval(() => { seenInProcess.clear(); }, 5 * 60_000); // каждые 5 минут очищаем
+setInterval(() => seenInProcess.clear(), 5 * 60_000);
 
 async function handleMessage(raw, tag) {
   let data = raw;
@@ -104,6 +115,7 @@ async function handleMessage(raw, tag) {
   if (!ca) return;
   if (seenInProcess.has(ca)) return;
   seenInProcess.add(ca);
+
   try { await saveToken(ca, data); }
   catch (e) { console.error(`[${tag}] DB error:`, e.message); }
 }
@@ -137,7 +149,7 @@ function connectWS({ url, subscribeMsg, headers, tag }) {
 
     ws.on('close', scheduleReconnect);
 
-    // сторожок: если 2 минуты нет новых save — форсим перезапуск сокета
+    // сторожок: если 2 минуты тишина — форсим reconnect
     const guard = setInterval(() => {
       const idleMs = Date.now() - (stats.lastSavedAt || 0);
       if (idleMs > 120_000) {
@@ -155,25 +167,23 @@ function connectWS({ url, subscribeMsg, headers, tag }) {
 (async () => {
   await initDb();
 
-  // 1) основной поток: PumpPortal (subscribeNewToken)
+  // основной поток: PumpPortal
   connectWS({
-    url: 'wss://pumpportal.fun/api/data',                 // офиц. точка PumpPortal
-    subscribeMsg: { method: 'subscribeNewToken' },        // новые токены
+    url: 'wss://pumpportal.fun/api/data',
+    subscribeMsg: { method: 'subscribeNewToken' },
     headers: undefined,
     tag: 'pumpportal',
   });
 
-  // 2) резервный поток (опционально): bloXroute или любой другой WS
-  // включается, если есть переменная окружения SECONDARY_WS_URL
+  // опционально: второй источник через переменные окружения
   if (process.env.SECONDARY_WS_URL) {
     const hdr = {};
     if (process.env.SECONDARY_WS_AUTH_HEADER && process.env.SECONDARY_WS_AUTH_VALUE) {
       hdr[process.env.SECONDARY_WS_AUTH_HEADER] = process.env.SECONDARY_WS_AUTH_VALUE;
     }
-    // для bloXroute метод обычно называется GetPumpFunNewTokensStream
     connectWS({
       url: process.env.SECONDARY_WS_URL,
-      subscribeMsg: { method: 'GetPumpFunNewTokensStream' }, // не страшно, если игнорится
+      subscribeMsg: { method: 'GetPumpFunNewTokensStream' },
       headers: hdr,
       tag: 'secondary',
     });
