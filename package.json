@@ -4,14 +4,10 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "postinstall": "npx puppeteer browsers install chrome --cache-dir=/opt/render/.cache/puppeteer || true"
-  },
-  "engines": {
-    "node": ">=20"
+    "start": "npx puppeteer browsers install chrome --cache-dir=/opt/render/.cache/puppeteer || true && node index.js"
   },
   "dependencies": {
     "node-fetch": "^3.3.2",
-    "puppeteer": "^23.0.2"
+    "puppeteer": "^23.3.0"
   }
 }
