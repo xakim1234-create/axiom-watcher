@@ -6,12 +6,13 @@
   "scripts": {
     "start-ws": "node index.js",
     "start-enrich": "node enrich.js",
-    "start": "node index.js",
-    "enrich": "node enrich.js"
+    "start": "node enrich.js"
   },
+  "engines": { "node": "22.x" },
   "dependencies": {
     "dotenv": "^16.4.5",
     "node-fetch": "^3.3.2",
-    "pg": "^8.11.5"
+    "pg": "^8.11.5",
+    "ws": "^8.18.0"
   }
 }
