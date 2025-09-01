@@ -5,10 +5,13 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "postinstall": "echo skip-postinstall"
+    "postinstall": "echo skip"
   },
   "dependencies": {
-    "node-fetch": "^3.3.2",
-    "puppeteer-core": "^23.0.2"
+    "puppeteer-core": "^23.0.2",
+    "node-fetch": "^3.3.2"
+  },
+  "engines": {
+    "node": "20.x"
   }
 }
