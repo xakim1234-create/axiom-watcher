@@ -4,13 +4,12 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "ws": "node index.js",
+    "start": "node enrich.js",
     "enrich": "node enrich.js"
   },
   "dependencies": {
-    "ws": "^8.17.0",
-    "pg": "^8.11.5",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "node-fetch": "^3.3.2",
+    "pg": "^8.11.5"
   }
 }
