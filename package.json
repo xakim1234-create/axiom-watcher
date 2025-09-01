@@ -6,7 +6,7 @@
   "scripts": {
     "start-ws": "node index.js",
     "start-enrich": "node enrich.js",
-    "start": "node index.js",          // можешь оставить start на WS, если хочешь
+    "start": "node index.js",
     "enrich": "node enrich.js"
   },
   "dependencies": {
