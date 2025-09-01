@@ -1,66 +1,39 @@
+// index.js
 import puppeteer from "puppeteer";
 import fetch from "node-fetch";
 
-/** ====== CONFIG ====== */
-const PAGE_URL = process.env.PAGE_URL || "https://axiom.trade/pulse";
-const CDN_HOST =
-  process.env.CDN_HOST || "axiomtrading.sfo3.cdn.digitaloceanspaces.com";
-const API_URL = process.env.API_URL;
-const BATCH_MS = +(process.env.BATCH_MS || 5000);
+/* ====== ENV ====== */
+const PAGE_URL  = process.env.PAGE_URL  || "https://axiom.trade/pulse";
+const CDN_HOST  = process.env.CDN_HOST  || "axiomtrading.sfo3.cdn.digitaloceanspaces.com";
+const API_URL   = process.env.API_URL;                 // твой Vercel endpoint
+const BATCH_MS  = +(process.env.BATCH_MS || 5000);
 
-// Хром, установленный на Render (пусть остаётся дефолт, можно переопределять env-ом)
-const EXEC_PATH =
-  process.env.PUPPETEER_EXECUTABLE_PATH ||
-  "/opt/render/.cache/puppeteer/chrome/linux-131.0.6778.204/chrome-linux64/chrome";
+// Путь к установленному Chrome (Render). Можно переопределить через ENV CHROME_PATH.
+const EXEC_PATH = process.env.CHROME_PATH
+  || "/opt/render/.cache/puppeteer/chrome/linux-131.0.6778.204/chrome-linux64/chrome";
 
-/** ====== GUARDS ====== */
 if (!API_URL) {
   console.error("❌ Set API_URL env (your Vercel endpoint)");
   process.exit(1);
 }
 
-/** ====== UTILS ====== */
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/* ====== STATE ====== */
+const queue   = new Set();
+const seenReq = new Set();
 
-/** Достаём mint из URL webp-картинки на CDN */
-function extractMintFromCdnPath(u) {
+/* ====== UTILS ====== */
+function extractMintFromUrl(u) {
   try {
-    const url = new URL(u);
-    if (!url.host.includes(CDN_HOST)) return null;
-    if (!url.pathname.endsWith(".webp")) return null;
-
-    const base = url.pathname.split("/").pop(); // пример: 24tBK...pump.webp  или  O_pfp.webp
-
-    // 1) <mint>pump.webp
-    const m1 = base.match(/^([A-Za-z0-9]{32,})pump\.webp$/);
-    if (m1) return m1[1];
-
-    // 2) <mint>npump.webp
-    const m2 = base.match(/^([A-Za-z0-9]{32,})npump\.webp$/);
-    if (m2) return m2[1];
-
-    // 3) *_pfp.webp — игнорим (аватарки)
-    if (/_pfp\.webp$/.test(base)) return null;
-
-    // На всякий случай: всё, что перед "pump.webp"
-    const i = base.indexOf("pump.webp");
-    if (i > 0) {
-      const maybe = base.slice(0, i);
-      if (/^[A-Za-z0-9]{32,}$/.test(maybe)) return maybe;
-    }
-
-    return null;
+    const last = u.split("/").pop().split("?")[0].split("#")[0];
+    const dot  = last.indexOf(".");
+    return dot === -1 ? last : last.slice(0, dot);
   } catch {
     return null;
   }
 }
 
-/** ====== QUEUE & FLUSH ====== */
-const queue = new Set();
-const seenReq = new Set();
-
 async function flush() {
-  if (queue.size === 0) return;
+  if (!queue.size) return;
   const mints = Array.from(queue);
   queue.clear();
   try {
@@ -75,90 +48,103 @@ async function flush() {
   }
 }
 
-/** ====== ROBUST GOTO ====== */
-async function gotoWithRetries(page, url, tries = 3) {
-  for (let i = 1; i <= tries; i++) {
+/** надёжная навигация с ретраями */
+async function gotoWithRetries(page, url, retries = 3, timeout = 45000) {
+  let lastErr;
+  for (let i = 1; i <= retries; i++) {
     try {
-      console.log(`🌐 goto attempt ${i}/${tries}: ${url}`);
-      await page.goto(url, {
-        waitUntil: ["domcontentloaded", "networkidle2"],
-        timeout: 45_000,
-      });
-      await sleep(1500); // даём подгрузиться картинкам
+      console.log(`🌐 goto attempt ${i}/${retries}: ${url}`);
+      await page.goto(url, { waitUntil: ["networkidle2", "domcontentloaded"], timeout });
       return;
-    } catch (e) {
-      console.warn(`⚠️ goto failed (${i}/${tries}): ${e.message}`);
-      if (i === tries) throw e;
-      await sleep(2000);
+    } catch (err) {
+      lastErr = err;
+      console.warn(`⚠️ goto failed (${i}/${retries}): ${err.message}`);
+      await page.waitForTimeout(1500);
     }
+  }
+  throw lastErr;
+}
+
+/** подготавливаем куки (главное — домен .axiom.trade для поддоменов) */
+function normalizeAxiomCookies() {
+  if (!process.env.AXIOM_COOKIES) return null;
+  try {
+    let cookies = JSON.parse(process.env.AXIOM_COOKIES);
+    cookies = cookies.map((c) => {
+      if (c.domain === "axiom.trade") c.domain = ".axiom.trade";
+      return c;
+    });
+    return cookies;
+  } catch (e) {
+    console.error("❌ Failed to parse AXIOM_COOKIES:", e);
+    return null;
   }
 }
 
-/** ====== MAIN ====== */
+/* ====== MAIN ====== */
 async function run() {
   console.log("🚀 Launching watcher...");
+
+  const launchArgs = ["--no-sandbox", "--disable-setuid-sandbox"];
+  if (process.env.PROXY_URL) launchArgs.push(`--proxy-server=${process.env.PROXY_URL}`);
 
   const browser = await puppeteer.launch({
     headless: true,
     executablePath: EXEC_PATH,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    args: launchArgs,
   });
 
   const page = await browser.newPage();
 
-  // user-agent/viewport ближе к твоим локальным условиям
-  await page.setUserAgent(
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131 Safari/537.36"
-  );
-  await page.setViewport({ width: 1366, height: 900, deviceScaleFactor: 1 });
-
-  // Куки с ENV (AXIOM_COOKIES) — JSON-массив
-  try {
-    if (process.env.AXIOM_COOKIES) {
-      const cookies = JSON.parse(process.env.AXIOM_COOKIES);
-      await page.setCookie(...cookies);
-      console.log(`🍪 Injected ${cookies.length} cookies for axiom.trade`);
-    } else {
-      console.warn("⚠️ No AXIOM_COOKIES provided, login may fail");
-    }
-  } catch (err) {
-    console.error("❌ Failed to load cookies:", err);
+  // Вкалываем куки для авторизации
+  const cookies = normalizeAxiomCookies();
+  if (cookies && cookies.length) {
+    await page.setCookie(...cookies);
+    console.log(`🍪 Injected ${cookies.length} cookies for axiom.trade`);
+  } else {
+    console.warn("⚠️ No AXIOM_COOKIES provided, login may fail");
   }
 
-  // Ловим все запросы, но извлекаем только .webp с CDN
+  // Чуть более тихий лог ошибок страницы (опционально)
+  page.on("console", (msg) => {
+    const t = msg.type();
+    if (t === "error" || t === "warning") {
+      console.log(`🖥️ page: ${t}`, msg.text());
+    }
+  });
+  page.on("pageerror", (err) => console.log("🖥️ pageerror:", err.message));
+  page.on("requestfailed", (req) =>
+    console.log("🖥️ requestfailed:", req.url(), req.failure()?.errorText || "")
+  );
+
+  // Перехват запросов и вытягивание минтов по CDN
   await page.setRequestInterception(true);
   page.on("request", (req) => {
-    const url = req.url();
-    if (seenReq.has(url)) return req.continue();
-    seenReq.add(url);
+    try {
+      const url = req.url();
+      if (seenReq.has(url)) return req.continue();
+      seenReq.add(url);
 
-    const mint = extractMintFromCdnPath(url);
-    if (mint) {
-      if (!queue.has(mint)) {
-        queue.add(mint);
-        console.log("👀 Found mint:", mint, "from", url);
+      // Ищем картинки токенов на CDN (webp/png/jpg, чтобы отсечь мусор)
+      if (
+        url.includes(CDN_HOST) &&
+        (url.endsWith(".webp") || url.endsWith(".png") || url.endsWith(".jpg"))
+      ) {
+        const mint = extractMintFromUrl(url);
+        if (mint) {
+          console.log("👀 Found mint:", mint, "from", url.slice(0, 140));
+          queue.add(mint);
+        }
       }
+      req.continue();
+    } catch {
+      req.continue();
     }
-    req.continue();
   });
 
-  // немножко логов со страницы — полезно в трейбле
-  page.on("console", (msg) =>
-    console.log("🖥️ page:", msg.type(), msg.text?.() ?? msg.text())
-  );
-  page.on("pageerror", (err) => console.log("🖥️ pageerror:", err.message));
-
+  // Сначала корень (прогреть сессию), затем /pulse
+  await gotoWithRetries(page, "https://axiom.trade", 3);
   await gotoWithRetries(page, PAGE_URL, 3);
-
-  // Автоскролл, чтобы подгружались новые карточки и их картинки
-  setInterval(async () => {
-    try {
-      await page.evaluate(() => window.scrollBy(0, 900));
-      await sleep(800);
-    } catch (e) {
-      console.warn("scroll error:", e.message);
-    }
-  }, 3500);
 
   // Периодическая отправка
   setInterval(flush, BATCH_MS);
