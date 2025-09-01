@@ -1,39 +1,42 @@
-// index.js
-import puppeteer from "puppeteer";
+// axiom-watcher: Pump.fun listener (imagedelivery.net/…/coin-image/<MINT>/…)
+import puppeteer from "puppeteer-core";
 import fetch from "node-fetch";
 
-/* ====== ENV ====== */
-const PAGE_URL  = process.env.PAGE_URL  || "https://axiom.trade/pulse";
-const CDN_HOST  = process.env.CDN_HOST  || "axiomtrading.sfo3.cdn.digitaloceanspaces.com";
-const API_URL   = process.env.API_URL;                 // твой Vercel endpoint
-const BATCH_MS  = +(process.env.BATCH_MS || 5000);
+const PAGE_URL = process.env.PAGE_URL || "https://pump.fun/advanced/scan";
+const API_URL = process.env.API_URL;                 // твой Vercel endpoint
+const BATCH_MS = +(process.env.BATCH_MS || 5000);
 
-// Путь к установленному Chrome (Render). Можно переопределить через ENV CHROME_PATH.
-const EXEC_PATH = process.env.CHROME_PATH
-  || "/opt/render/.cache/puppeteer/chrome/linux-131.0.6778.204/chrome-linux64/chrome";
+// где лежит Chrome на Render (мы ставим его в Start Command)
+const CHROME_PATH =
+  process.env.PUPPETEER_EXEC_PATH ||
+  "/opt/render/.cache/puppeteer/chrome/linux-131.0.6778.204/chrome-linux64/chrome";
 
 if (!API_URL) {
   console.error("❌ Set API_URL env (your Vercel endpoint)");
   process.exit(1);
 }
 
-/* ====== STATE ====== */
-const queue   = new Set();
+// ===== helpers =====
+const queue = new Set();
 const seenReq = new Set();
 
-/* ====== UTILS ====== */
-function extractMintFromUrl(u) {
+function extractMintFromDeliveryUrl(u) {
   try {
-    const last = u.split("/").pop().split("?")[0].split("#")[0];
-    const dot  = last.indexOf(".");
-    return dot === -1 ? last : last.slice(0, dot);
+    // ожидаем: https://imagedelivery.net/.../coin-image/<MINT>/72x72?... или 128x128...
+    const i = u.indexOf("/coin-image/");
+    if (i === -1) return null;
+    const tail = u.slice(i + "/coin-image/".length);
+    // <MINT>/72x72?alpha=true
+    const mint = tail.split("/")[0];
+    if (!mint || mint.length < 8) return null;
+    return mint;
   } catch {
     return null;
   }
 }
 
 async function flush() {
-  if (!queue.size) return;
+  if (queue.size === 0) return;
   const mints = Array.from(queue);
   queue.clear();
   try {
@@ -42,111 +45,159 @@ async function flush() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mints }),
     });
-    console.log("✅ Flushed mints:", mints);
+    console.log("✅ Flushed mints:", mints.length, mints.slice(0, 5));
   } catch (e) {
-    console.error("❌ Failed to flush:", e);
+    console.error("❌ Failed to flush:", e?.message || e);
   }
 }
 
-/** надёжная навигация с ретраями */
-async function gotoWithRetries(page, url, retries = 3, timeout = 45000) {
-  let lastErr;
-  for (let i = 1; i <= retries; i++) {
+async function gotoWithRetries(page, url, tries = 3) {
+  for (let i = 1; i <= tries; i++) {
     try {
-      console.log(`🌐 goto attempt ${i}/${retries}: ${url}`);
-      await page.goto(url, { waitUntil: ["networkidle2", "domcontentloaded"], timeout });
+      console.log(`🌐 goto attempt ${i}/${tries}: ${url}`);
+      await page.goto(url, { waitUntil: "networkidle2", timeout: 45_000 });
       return;
     } catch (err) {
-      lastErr = err;
-      console.warn(`⚠️ goto failed (${i}/${retries}): ${err.message}`);
-      await page.waitForTimeout(1500);
+      console.warn(`⚠️ goto failed (${i}/${tries}): ${err?.message || err}`);
+      // маленькая пауза между попытками
+      await page.waitForTimeout?.(1500).catch(() => {});
     }
   }
-  throw lastErr;
+  throw new Error("goto failed after retries");
 }
 
-/** подготавливаем куки (главное — домен .axiom.trade для поддоменов) */
-function normalizeAxiomCookies() {
-  if (!process.env.AXIOM_COOKIES) return null;
-  try {
-    let cookies = JSON.parse(process.env.AXIOM_COOKIES);
-    cookies = cookies.map((c) => {
-      if (c.domain === "axiom.trade") c.domain = ".axiom.trade";
-      return c;
-    });
-    return cookies;
-  } catch (e) {
-    console.error("❌ Failed to parse AXIOM_COOKIES:", e);
-    return null;
+// мягкое гашение модалок + жёсткий css-фолбэк
+async function dismissOverlays(page) {
+  // 1) на всякий: кнопки «Next / Done / Accept …»
+  const clickers = [
+    'button:has-text("Next")',
+    'button:has-text("Done")',
+    'button:has-text("Понятно")',
+    'button:has-text("Accept all")',
+    'button:has-text("Accept All")',
+    'button:has-text("Accept")',
+    'button:has-text("Принять")',
+    '[aria-label="Close"]',
+    'button[aria-label="Close"]',
+  ];
+
+  for (const sel of clickers) {
+    try {
+      const btn = await page.$(sel);
+      if (btn) {
+        await btn.click({ delay: 50 });
+        await page.waitForTimeout?.(200).catch(() => {});
+      }
+    } catch {}
   }
+
+  // send ESC несколько раз
+  try {
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout?.(200).catch(() => {});
+    await page.keyboard.press("Escape");
+  } catch {}
+
+  // 2) жёсткий CSS-фолбэк (скроет любые overlay/role=dialog)
+  await page.addStyleTag({
+    content: `
+      [role="dialog"], [role="alertdialog"], .modal, .Modal, .DialogOverlay,
+      .overlay, .Overlay, .backdrop, .Backdrop, .cookie, .Cookie {
+        display: none !important;
+        visibility: hidden !important;
+        pointer-events: none !important;
+      }
+      html, body { overflow: auto !important; }
+    `,
+  }).catch(() => {});
 }
 
-/* ====== MAIN ====== */
-async function run() {
-  console.log("🚀 Launching watcher...");
+async function antiOnboarding(page) {
+  // ставим флажки ДО загрузки страницы (на всякий)
+  await page.evaluateOnNewDocument(() => {
+    try {
+      const set = (k, v) => localStorage.setItem(k, typeof v === "string" ? v : JSON.stringify(v));
+      // разные варианты ключей – с запасом
+      set("scanSettingsOnboardingSeen", "true");
+      set("scan-onboarding", "done");
+      set("cookie_consent", "true");
+      set("cookie-consent", "true");
+      document.addEventListener("DOMContentLoaded", () => {
+        const style = document.createElement("style");
+        style.textContent = `
+          [role="dialog"], .modal, .overlay, .backdrop { display:none !important; }
+          html, body { overflow:auto !important; }
+        `;
+        document.documentElement.appendChild(style);
+      });
+    } catch {}
+  });
+}
 
-  const launchArgs = ["--no-sandbox", "--disable-setuid-sandbox"];
-  if (process.env.PROXY_URL) launchArgs.push(`--proxy-server=${process.env.PROXY_URL}`);
+async function keepPageAlive(page) {
+  // небольшой «джанитор»: раз в 5 сек гасим внезапные модалки
+  setInterval(() => {
+    dismissOverlays(page).catch(() => {});
+  }, 5000);
+}
+
+// ===== main =====
+async function run() {
+  console.log("🚀 Launching watcher (Pump.fun)…");
 
   const browser = await puppeteer.launch({
     headless: true,
-    executablePath: EXEC_PATH,
-    args: launchArgs,
+    executablePath: CHROME_PATH,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+    ],
   });
 
   const page = await browser.newPage();
+  page.setDefaultNavigationTimeout(60_000);
 
-  // Вкалываем куки для авторизации
-  const cookies = normalizeAxiomCookies();
-  if (cookies && cookies.length) {
-    await page.setCookie(...cookies);
-    console.log(`🍪 Injected ${cookies.length} cookies for axiom.trade`);
-  } else {
-    console.warn("⚠️ No AXIOM_COOKIES provided, login may fail");
-  }
-
-  // Чуть более тихий лог ошибок страницы (опционально)
-  page.on("console", (msg) => {
-    const t = msg.type();
-    if (t === "error" || t === "warning") {
-      console.log(`🖥️ page: ${t}`, msg.text());
-    }
-  });
-  page.on("pageerror", (err) => console.log("🖥️ pageerror:", err.message));
-  page.on("requestfailed", (req) =>
-    console.log("🖥️ requestfailed:", req.url(), req.failure()?.errorText || "")
+  await page.setUserAgent(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131 Safari/537.36"
   );
 
-  // Перехват запросов и вытягивание минтов по CDN
+  await antiOnboarding(page);
+
+  // слушаем только imagedelivery
   await page.setRequestInterception(true);
   page.on("request", (req) => {
-    try {
-      const url = req.url();
-      if (seenReq.has(url)) return req.continue();
-      seenReq.add(url);
+    const url = req.url();
+    // пропускаем сразу всё — нам важно только «услышать» URL
+    req.continue().catch(() => {});
+    if (seenReq.has(url)) return;
+    seenReq.add(url);
 
-      // Ищем картинки токенов на CDN (webp/png/jpg, чтобы отсечь мусор)
-      if (
-        url.includes(CDN_HOST) &&
-        (url.endsWith(".webp") || url.endsWith(".png") || url.endsWith(".jpg"))
-      ) {
-        const mint = extractMintFromUrl(url);
-        if (mint) {
-          console.log("👀 Found mint:", mint, "from", url.slice(0, 140));
-          queue.add(mint);
-        }
+    if (
+      url.startsWith("https://imagedelivery.net/") &&
+      url.includes("/coin-image/") &&
+      /\/(32|64|72|128|256)x(32|64|72|128|256)/.test(url) // иконки разных размеров
+    ) {
+      const mint = extractMintFromDeliveryUrl(url);
+      if (mint) {
+        queue.add(mint);
+        // для отладки можно включить:
+        // console.log("👀 mint:", mint);
       }
-      req.continue();
-    } catch {
-      req.continue();
     }
   });
 
-  // Сначала корень (прогреть сессию), затем /pulse
-  await gotoWithRetries(page, "https://axiom.trade", 3);
   await gotoWithRetries(page, PAGE_URL, 3);
+  await dismissOverlays(page);
+  await keepPageAlive(page);
 
-  // Периодическая отправка
+  // периодический «пинок», чтобы лента обновлялась
+  setInterval(async () => {
+    try {
+      await page.evaluate(() => window.scrollTo(0, Math.random() * 1000));
+    } catch {}
+  }, 10_000);
+
   setInterval(flush, BATCH_MS);
 }
 
