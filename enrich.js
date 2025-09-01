@@ -1,403 +1,363 @@
-// enrich.js
+// enrich.js — S1: первые 10 минут от dev-buy, с 2м запасом (12м фильтр).
+import 'dotenv/config';
+import fetch from 'node-fetch';
 import { Pool } from 'pg';
 
-// ---------- CONFIG ----------
-const DB_URL = process.env.DATABASE_URL;
+// ---------- настройки ----------
+const DB_URL           = process.env.DATABASE_URL || process.env.NEON_DATABASE_URL;
+const PAUSE_MS         = 5000;   // пауза между токенами
+const WAIT_MINUTES     = 10;     // считаем только, когда токену >= 10 мин
+const CANDLE_LIMIT     = 30;     // берём ~30 баров 1m, но дальше фильтруем окном 12м
+const INTERVAL         = '1m';
+const CURRENCY         = 'USD';
+const RETRY_IN_MIN     = 15;     // повтор при сбое/дыре
+const MAX_FETCH_RETRY  = 4;      // ретраи на 429/403/503
+
 if (!DB_URL) {
   console.error('DATABASE_URL is not set');
   process.exit(1);
 }
 
-const MIN_AGE_MIN = 10;          // берём токены, старше 10 минут
-const PAUSE_MS = 5_000;          // пауза между токенами
-const SELECT_LIMIT = 1;          // по одному токену
-const TRADES_LIMIT = 100;        // лимит /trades/batch
-const CANDLES_LIMIT = 30;        // берём ~30 минутных свечей
-const CURRENCY = 'USD';
-const INTERVAL = '1m';
+// ---------- PG ----------
+const pool = new Pool({ connectionString: DB_URL, ssl: { rejectUnauthorized: false } });
 
-// ---------- DB ----------
-const pool = new Pool({
-  connectionString: DB_URL,
-  ssl: { rejectUnauthorized: false },
-});
-
-// ---------- HELPERS ----------
+// ---------- helpers ----------
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const ceilToMinute = (ts) => Math.ceil(ts / 60000) * 60000;
 
-const ceilToMinute = (tsMs) => Math.ceil(tsMs / 60_000) * 60_000;
+const round = (v, dp) => (v == null || !Number.isFinite(v)) ? null
+  : Math.round(v * 10**dp) / 10**dp;
 
-const safeNum = (v) => {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-};
-
-function athInWindow(candles, supplyDisplay, startMs, windowMinutes) {
-  const end = startMs + windowMinutes * 60_000;
-  let top = null;
-  let topTs = null;
-
-  for (const c of candles) {
-    const t = Number(c.timestamp);
-    if (!Number.isFinite(t)) continue;
-    if (t < startMs || t > end) continue;
-
-    const price = safeNum(c.close ?? c.open);
-    if (price == null) continue;
-    const mc = price * supplyDisplay;
-    if (top == null || mc > top) {
-      top = mc;
-      topTs = t;
-    }
-  }
-  return { usd: top, ts: topTs };
+function mc(price, supplyDisplay) {
+  const p = Number(price);
+  if (!Number.isFinite(p)) return null;
+  return p * Number(supplyDisplay);
 }
 
-function globalAthFromCandles(candles, supplyDisplay) {
-  let top = null;
-  let topTs = null;
-  for (const c of candles) {
-    const t = Number(c.timestamp);
-    if (!Number.isFinite(t)) continue;
-    const price = safeNum(c.close ?? c.open);
-    if (price == null) continue;
-    const mc = price * supplyDisplay;
-    if (top == null || mc > top) {
-      top = mc;
-      topTs = t;
-    }
-  }
-  return { usd: top, ts: topTs };
+function isRate(r, text='') {
+  return r && (r.status === 429 || r.status === 403 || r.status === 503) ||
+         /rate limited|cloudflare|cf-error/i.test(text);
 }
 
-function deriveXandPct(startMc, athUsd) {
-  if (!Number.isFinite(startMc) || startMc <= 0 || !Number.isFinite(athUsd)) {
-    return { x: null, pct: null };
-  }
-  const x = athUsd / startMc;
-  const pct = (x - 1) * 100;
-  return { x, pct };
-}
-
-function isRateLimit(res, text) {
-  if (res && (res.status === 429 || res.status === 403)) return true;
-  // Cloudflare html page often includes 'You are being rate limited' or 'cf-error-details'
-  return text && /rate limited|cloudflare|cf-error/i.test(text);
-}
-
-// ---------- API ----------
-async function fetchJson(url, opts = {}) {
-  const r = await fetch(url, opts);
-  let bodyText = '';
-  try { bodyText = await r.text(); } catch {}
+async function fetchJson(url, options = {}, retry = 0) {
+  const r = await fetch(url, options);
+  let text = '';
+  try { text = await r.text(); } catch {}
   if (!r.ok) {
-    if (isRateLimit(r, bodyText)) {
-      const e = new Error('rate-limit');
-      e.isRate = true;
-      throw e;
+    if (isRate(r, text) && retry < MAX_FETCH_RETRY) {
+      const backoff = 2000 * Math.pow(2, retry); // 2s,4s,8s,16s
+      await sleep(backoff);
+      return fetchJson(url, options, retry + 1);
     }
-    throw new Error(`${r.status} ${url} -> ${bodyText.slice(0, 200)}`);
+    throw new Error(`${url} -> ${r.status} ${text.slice(0,200)}`);
   }
-  try {
-    return JSON.parse(bodyText);
-  } catch (e) {
-    throw new Error(`bad json from ${url}: ${bodyText.slice(0, 200)}`);
-  }
+  try { return JSON.parse(text); }
+  catch { throw new Error(`bad json from ${url}: ${text.slice(0,200)}`); }
 }
 
-async function getRepo(ca) {
-  const url = `https://frontend-api-v3.pump.fun/coins/${ca}`;
-  return fetchJson(url);
-}
-
-async function getCandles(ca, createdTs) {
-  const u = new URL(`https://swap-api.pump.fun/v2/coins/${ca}/candles`);
-  u.searchParams.set('interval', INTERVAL);
-  u.searchParams.set('limit', String(CANDLES_LIMIT));
-  u.searchParams.set('currency', CURRENCY);
-  u.searchParams.set('createdTs', String(createdTs));
-  const arr = await fetchJson(u.toString());
-  if (!Array.isArray(arr)) return [];
-  arr.sort((a, b) => Number(a.timestamp) - Number(b.timestamp));
-  for (const c of arr) {
-    c.open  = safeNum(c.open);
-    c.high  = safeNum(c.high);
-    c.low   = safeNum(c.low);
-    c.close = safeNum(c.close);
-  }
-  return arr;
-}
-
-async function devBuyBatch(ca, creator, afterTs, beforeTs, limit = TRADES_LIMIT) {
-  const url = `https://swap-api.pump.fun/v1/coins/${ca}/trades/batch`;
-  const body = {
-    userAddresses: [creator],
-    limit: Math.min(limit, TRADES_LIMIT),
-    afterTs,
-    beforeTs,
-  };
+async function postJson(url, body, retry = 0) {
   const r = await fetch(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   });
-  const t = await r.text();
+  let text = '';
+  try { text = await r.text(); } catch {}
   if (!r.ok) {
-    if (isRateLimit(r, t)) {
-      const e = new Error('rate-limit');
-      e.isRate = true;
-      throw e;
+    if (isRate(r, text) && retry < MAX_FETCH_RETRY) {
+      const backoff = 2000 * Math.pow(2, retry);
+      await sleep(backoff);
+      return postJson(url, body, retry + 1);
     }
-    throw new Error(`trades/batch ${r.status}: ${t.slice(0, 200)}`);
+    throw new Error(`${url} -> ${r.status} ${text.slice(0,200)}`);
   }
-  const j = JSON.parse(t);
-  const rows = Array.isArray(j?.[creator]) ? j[creator] : [];
-  // first buy
-  const buys = rows
-    .filter(x => x?.type === 'buy')
-    .map(x => ({
-      ts: Date.parse(x.timestamp),
-      price: safeNum(x.priceUSD),
-    }))
-    .filter(o => Number.isFinite(o.ts) && Number.isFinite(o.price))
-    .sort((a, b) => a.ts - b.ts);
-  return buys[0] || null;
+  try { return JSON.parse(text); }
+  catch { throw new Error(`bad json from ${url}: ${text.slice(0,200)}`); }
 }
 
-// ---------- DB helpers ----------
-async function selectNextToken(client) {
-  const sql = `
+// ---------- API ----------
+async function getRepo(mint) {
+  const url = `https://frontend-api-v3.pump.fun/coins/${mint}`;
+  return fetchJson(url);
+}
+
+async function getCandles(mint, createdTs) {
+  const url = new URL(`https://swap-api.pump.fun/v2/coins/${mint}/candles`);
+  url.searchParams.set('interval', INTERVAL);
+  url.searchParams.set('limit', String(CANDLE_LIMIT));
+  url.searchParams.set('currency', CURRENCY);
+  url.searchParams.set('createdTs', String(createdTs));
+  const arr = await fetchJson(url.toString());
+  if (!Array.isArray(arr)) return [];
+  arr.sort((a,b) => Number(a.timestamp) - Number(b.timestamp));
+  // привести к числам
+  for (const c of arr) {
+    c.open  = Number(c.open);
+    c.high  = Number(c.high);
+    c.low   = Number(c.low);
+    c.close = Number(c.close);
+  }
+  return arr;
+}
+
+async function getDevBuys(mint, creator, createdTs) {
+  const afterTs  = createdTs - 30_000;
+  const beforeTs = createdTs + 5*60_000;
+  const url = `https://swap-api.pump.fun/v1/coins/${mint}/trades/batch`;
+  const j = await postJson(url, {
+    userAddresses: [creator],
+    limit: 100,
+    afterTs, beforeTs,
+  });
+  const arr = Array.isArray(j?.[creator]) ? j[creator] : [];
+  const buys = arr
+    .filter(t => t.type === 'buy')
+    .map(t => ({ ts: Date.parse(t.timestamp), price: Number(t.priceUSD) }))
+    .filter(o => Number.isFinite(o.ts) && Number.isFinite(o.price))
+    .sort((a,b) => a.ts - b.ts);
+  return buys;
+}
+
+// ---------- БД ----------
+async function pickQueue(client) {
+  const q = `
     SELECT ca
     FROM pump_tokens
-    WHERE (enrich_status IS NULL OR enrich_status IN ('new','retry'))
-      AND inserted_at <= now() - interval '${MIN_AGE_MIN} minutes'
+    WHERE (enrich_status IN ('new','retry') OR enrich_status IS NULL)
+      AND now() - inserted_at >= interval '${WAIT_MINUTES} minutes'
       AND (next_enrich_at IS NULL OR next_enrich_at <= now())
-    ORDER BY inserted_at
-    LIMIT ${SELECT_LIMIT};
+    ORDER BY inserted_at ASC
+    LIMIT 25
   `;
-  const { rows } = await client.query(sql);
+  const { rows } = await client.query(q);
   return rows.map(r => r.ca);
 }
 
-async function markRetry(client, ca, msg, minutes = 30) {
+async function markRetry(client, ca, msg) {
   await client.query(
-    `
-    UPDATE pump_tokens
-    SET enrich_status = 'retry',
-        next_enrich_at = now() + interval '${minutes} minutes',
-        last_error = $2,
-        error_count = COALESCE(error_count, 0) + 1
-    WHERE ca = $1
-    `,
-    [ca, String(msg).slice(0, 500)],
+    `UPDATE pump_tokens
+       SET enrich_status = 'retry',
+           next_enrich_at = now() + interval '${RETRY_IN_MIN} minutes',
+           last_error = $2,
+           error_count = COALESCE(error_count,0)+1
+     WHERE ca = $1`,
+    [ca, String(msg).slice(0, 500)]
   );
 }
 
-async function markError(client, ca, msg) {
-  await client.query(
-    `
-    UPDATE pump_tokens
-    SET enrich_status = 'err',
-        next_enrich_at = now() + interval '60 minutes',
-        last_error = $2,
-        error_count = COALESCE(error_count, 0) + 1
-    WHERE ca = $1
-    `,
-    [ca, String(msg).slice(0, 500)],
-  );
-}
+async function markOk(client, ca, payload) {
+  const {
+    creator, t0Ms, p0PriceUsd, startMcUsd, supplyDisplay,
+    ath1mUsd, ath1mTsMs, ath5mUsd, ath5mTsMs, ath10mUsd, ath10mTsMs,
+    ath1mX, ath1mPct, ath5mX, ath5mPct, ath10mX, ath10mPct
+  } = payload;
 
-async function markOk(client, data) {
-  // ВАЖНО: явные приведения типов — никаких "could not determine data type …"
-  const sql = `
-  UPDATE pump_tokens
-  SET
-    creator          = $1,
-    t0               = to_timestamp($2::double precision / 1000.0),
-    p0_price_usd     = $3::numeric,
-    start_mc_usd     = $4::numeric,
+  // ЯВНЫЕ КАСТЫ: никаких "could not determine data type of parameter $N"
+  const UPDATE_SQL = `
+  UPDATE pump_tokens SET
+    creator        = COALESCE(creator, $2::text),
 
-    ath_1m_usd       = $5::numeric,
-    ath_1m_ts        = CASE WHEN $6 IS NULL  THEN NULL
-                            ELSE to_timestamp($6::double precision / 1000.0) END,
+    t0             = CASE WHEN $3 IS NULL THEN NULL
+                          ELSE to_timestamp($3::double precision/1000.0) END,
+    p0_price_usd   = $4::numeric,
+    start_mc_usd   = $5::numeric,
 
-    ath_5m_usd       = $7::numeric,
-    ath_5m_ts        = CASE WHEN $8 IS NULL  THEN NULL
-                            ELSE to_timestamp($8::double precision / 1000.0) END,
+    ath_1m_usd     = $6::numeric,
+    ath_1m_ts      = CASE WHEN $7 IS NULL THEN NULL
+                          ELSE to_timestamp($7::double precision/1000.0) END,
 
-    ath_10m_usd      = $9::numeric,
-    ath_10m_ts       = CASE WHEN $10 IS NULL THEN NULL
-                            ELSE to_timestamp($10::double precision / 1000.0) END,
+    ath_5m_usd     = $8::numeric,
+    ath_5m_ts      = CASE WHEN $9 IS NULL THEN NULL
+                          ELSE to_timestamp($9::double precision/1000.0) END,
 
-    ath_all_usd      = $11::numeric,
-    ath_all_ts       = CASE WHEN $12 IS NULL THEN NULL
-                            ELSE to_timestamp($12::double precision / 1000.0) END,
+    ath_10m_usd    = $10::numeric,
+    ath_10m_ts     = CASE WHEN $11 IS NULL THEN NULL
+                          ELSE to_timestamp($11::double precision/1000.0) END,
 
-    ath_1m_x         = $13::numeric,
-    ath_5m_x         = $14::numeric,
-    ath_10m_x        = $15::numeric,
+    ath_1m_x       = $12::numeric,
+    ath_1m_pct     = $13::numeric,
+    ath_5m_x       = $14::numeric,
+    ath_5m_pct     = $15::numeric,
+    ath_10m_x      = $16::numeric,
+    ath_10m_pct    = $17::numeric,
 
-    ath_1m_pct       = $16::numeric,
-    ath_5m_pct       = $17::numeric,
-    ath_10m_pct      = $18::numeric,
+    supply_display = COALESCE(supply_display, $18::numeric),
 
-    supply_display   = $19::numeric,
-
-    enrich_status    = 'ok',
-    enriched_at      = now(),
-    next_enrich_at   = NULL,
-    last_error       = NULL,
-    error_count      = 0
-  WHERE ca = $20
+    enrich_status  = 'ok',
+    enriched_at    = now(),
+    next_enrich_at = NULL,
+    last_error     = NULL
+  WHERE ca = $1::text
   `;
+
   const params = [
-    data.creator,          // $1
-    data.t0Ms,             // $2
-    data.p0PriceUsd,       // $3
-    data.startMcUsd,       // $4
-    data.ath1mUsd,         // $5
-    data.ath1mTsMs,        // $6
-    data.ath5mUsd,         // $7
-    data.ath5mTsMs,        // $8
-    data.ath10mUsd,        // $9
-    data.ath10mTsMs,       // $10
-    data.athAllUsd,        // $11
-    data.athAllTsMs,       // $12
-    data.ath1mX,           // $13
-    data.ath5mX,           // $14
-    data.ath10mX,          // $15
-    data.ath1mPct,         // $16
-    data.ath5mPct,         // $17
-    data.ath10mPct,        // $18
-    data.supplyDisplay,    // $19
-    data.ca,               // $20
+    ca,                // $1
+    creator ?? null,   // $2
+    t0Ms ?? null,      // $3  (ms)
+    p0PriceUsd ?? null,// $4
+    startMcUsd ?? null,// $5
+
+    ath1mUsd ?? null,  // $6
+    ath1mTsMs ?? null, // $7
+    ath5mUsd ?? null,  // $8
+    ath5mTsMs ?? null, // $9
+    ath10mUsd ?? null, // $10
+    ath10mTsMs ?? null,// $11
+
+    ath1mX ?? null,    // $12
+    ath1mPct ?? null,  // $13
+    ath5mX ?? null,    // $14
+    ath5mPct ?? null,  // $15
+    ath10mX ?? null,   // $16
+    ath10mPct ?? null, // $17
+
+    supplyDisplay ?? null // $18
   ];
-  await pool.query(sql, params);
+  await client.query(UPDATE_SQL, params);
+
+  // token_snapshots — одна фиксация, без дублей (NOT EXISTS)
+  await client.query(
+    `
+    INSERT INTO token_snapshots
+      (ca, snap_ts, usd_market_cap, supply_display,
+       dev, p0_price_usd, start_mc_usd,
+       ath_5m_usd, ath_5m_ts)
+    SELECT
+      $1, now(), NULL, $2,
+      $3, $4, $5,
+      $6, CASE WHEN $7 IS NULL THEN NULL ELSE to_timestamp($7::double precision/1000.0) END
+    WHERE NOT EXISTS (SELECT 1 FROM token_snapshots WHERE ca = $1)
+    `,
+    [
+      ca,
+      supplyDisplay ?? null,
+      creator ?? null,
+      p0PriceUsd ?? null,
+      startMcUsd ?? null,
+      ath5mUsd ?? null,
+      ath5mTsMs ?? null,
+    ]
+  );
 }
 
-// ---------- CORE ----------
+// ---------- основной расчёт ----------
 async function processOne(client, ca) {
   try {
-    // 1) repo
+    // repo → creator, supply, createdTs
     const repo = await getRepo(ca);
-    const createdTs = +repo.created_timestamp; // ms
-    const creator = repo.creator || null;
-    const decimals = Number.isFinite(repo.decimals) ? repo.decimals : 6;
-    const totalSupply = safeNum(repo.total_supply) ?? 0;
-    const supplyDisplay = totalSupply / Math.pow(10, decimals);
+    const createdTs = +repo.created_timestamp;
+    const creator   = repo.creator;
+    const decimals  = Number.isFinite(repo.decimals) ? repo.decimals : 6;
+    const supply    = Number(repo.total_supply) || 0;
+    const supplyDisplay = supply / Math.pow(10, decimals);
 
-    // 2) dev-buy
-    if (!creator || !Number.isFinite(createdTs)) {
-      await markRetry(client, ca, 'missing creator or createdTs', 30);
+    if (!creator || !Number.isFinite(createdTs) || supplyDisplay <= 0) {
+      await markRetry(client, ca, 'missing creator/createdTs/supply');
       return;
     }
-    const dev = await devBuyBatch(
-      ca,
-      creator,
-      createdTs - 30_000,
-      createdTs + 5 * 60_000,
-      TRADES_LIMIT
-    );
-    if (!dev) {
-      await markRetry(client, ca, 'dev-buy not found', 30);
-      return;
-    }
-    const t0Ms = dev.ts;
-    const p0PriceUsd = dev.price;
-    if (!Number.isFinite(t0Ms) || !Number.isFinite(p0PriceUsd) || supplyDisplay <= 0) {
-      await markRetry(client, ca, 'bad t0/p0/supply', 30);
-      return;
-    }
-    const startMcUsd = p0PriceUsd * supplyDisplay;
 
-    // 3) свечи
+    // dev-buy (первая покупка дева)
+    const devBuys = await getDevBuys(ca, creator, createdTs);
+    if (!devBuys.length) {
+      await markRetry(client, ca, 'dev-buy not found yet');
+      return;
+    }
+    const t0Ms = devBuys[0].ts;
+    const p0   = devBuys[0].price;
+    if (!Number.isFinite(t0Ms) || !Number.isFinite(p0)) {
+      await markRetry(client, ca, 'bad t0/p0');
+      return;
+    }
+
+    const startMc = mc(p0, supplyDisplay);
+
+    // свечи → фильтруем только окно [ceil(t0) .. +12m]
     const candles = await getCandles(ca, createdTs);
-    const minStart = ceilToMinute(t0Ms);
+    const winStart = ceilToMinute(t0Ms);
+    const end1  = winStart + 1*60*1000;
+    const end5  = winStart + 5*60*1000;
+    const end10 = winStart +10*60*1000;
+    const end12 = winStart +12*60*1000;
 
-    const a1 = athInWindow(candles, supplyDisplay, minStart, 1);
-    const a5 = athInWindow(candles, supplyDisplay, minStart, 5);
-    const a10 = athInWindow(candles, supplyDisplay, minStart, 10);
-    const aall = globalAthFromCandles(candles, supplyDisplay);
+    let ath1 = null, ath1Ts = null;
+    let ath5 = null, ath5Ts = null;
+    let ath10= null, ath10Ts = null;
 
-    // fallback'и
-    const ath1mUsd = a1.usd ?? startMcUsd;
-    const ath1mTsMs = a1.ts ?? null;
+    for (const c of candles) {
+      const ts = Number(c.timestamp);
+      if (!Number.isFinite(ts)) continue;
+      if (ts < winStart || ts > end12) continue; // за пределы 12 минут не выходим
 
-    const ath5mUsd = a5.usd ?? startMcUsd;
-    const ath5mTsMs = a5.ts ?? null;
+      const price = Number.isFinite(c.close) ? c.close : c.open;
+      const mcap  = mc(price, supplyDisplay);
+      if (mcap == null) continue;
 
-    const ath10mUsd = a10.usd ?? startMcUsd;
-    const ath10mTsMs = a10.ts ?? null;
+      if (ts <= end1  && (ath1  == null || mcap > ath1 )) { ath1  = mcap; ath1Ts  = ts; }
+      if (ts <= end5  && (ath5  == null || mcap > ath5 )) { ath5  = mcap; ath5Ts  = ts; }
+      if (ts <= end10 && (ath10 == null || mcap > ath10)) { ath10 = mcap; ath10Ts = ts; }
+    }
 
-    // глобальный ATH — если в свечах нет, возьмём repo.usd_market_cap
-    let athAllUsd = aall.usd ?? safeNum(repo.usd_market_cap) ?? null;
-    let athAllTsMs = aall.ts ?? null;
+    // фолбэки к старту (даст 0%)
+    if (ath1  == null) { ath1  = startMc; ath1Ts  = null; }
+    if (ath5  == null) { ath5  = startMc; ath5Ts  = null; }
+    if (ath10 == null) { ath10 = startMc; ath10Ts = null; }
 
-    // 4) производные (X и %)
-    const { x: x1, pct: p1 } = deriveXandPct(startMcUsd, ath1mUsd);
-    const { x: x5, pct: p5 } = deriveXandPct(startMcUsd, ath5mUsd);
-    const { x: x10, pct: p10 } = deriveXandPct(startMcUsd, ath10mUsd);
+    // X и %
+    const x1  = (Number.isFinite(ath1)  && Number.isFinite(startMc) && startMc>0) ? (ath1 / startMc)  : null;
+    const x5  = (Number.isFinite(ath5)  && Number.isFinite(startMc) && startMc>0) ? (ath5 / startMc)  : null;
+    const x10 = (Number.isFinite(ath10) && Number.isFinite(startMc) && startMc>0) ? (ath10 / startMc) : null;
 
-    // 5) save
-    await markOk(client, {
-      ca,
+    const pct1  = (x1  == null) ? null : (x1  - 1) * 100;
+    const pct5  = (x5  == null) ? null : (x5  - 1) * 100;
+    const pct10 = (x10 == null) ? null : (x10 - 1) * 100;
+
+    // округления: X до 3 знаков, % до 2 знаков
+    const payload = {
       creator,
       t0Ms,
-      p0PriceUsd,
-      startMcUsd,
+      p0PriceUsd: p0,
+      startMcUsd: startMc,
       supplyDisplay,
 
-      ath1mUsd,  ath1mTsMs,
-      ath5mUsd,  ath5mTsMs,
-      ath10mUsd, ath10mTsMs,
+      ath1mUsd: ath1,  ath1mTsMs: ath1Ts,
+      ath5mUsd: ath5,  ath5mTsMs: ath5Ts,
+      ath10mUsd: ath10,ath10mTsMs: ath10Ts,
 
-      athAllUsd, athAllTsMs,
+      ath1mX:  round(x1, 3),
+      ath1mPct: round(pct1, 2),
+      ath5mX:  round(x5, 3),
+      ath5mPct: round(pct5, 2),
+      ath10mX: round(x10,3),
+      ath10mPct: round(pct10,2),
+    };
 
-      ath1mX:  x1,  ath1mPct:  p1,
-      ath5mX:  x5,  ath5mPct:  p5,
-      ath10mX: x10, ath10mPct: p10,
-    });
-
+    await markOk(client, ca, payload);
     console.log('enriched', ca);
   } catch (e) {
-    // rate-limit → переназначаем next_enrich_at и выходим
-    if (e?.isRate || /rate-limit/i.test(String(e?.message))) {
-      await markRetry(client, ca, 'rate-limit', 60);
-      console.warn('rate-limit, delayed', ca);
-      return;
-    }
-    // прочие ошибки — ставим err (но продолжаем цикл)
-    await markError(client, ca, e?.message || e);
-    console.error('fatal error:', e?.message || e);
+    await markRetry(client, ca, e?.message || String(e));
+    console.warn('loop error:', e?.message || e);
   }
 }
 
+// ---------- цикл ----------
 async function loop() {
-  console.log(`enricher started | wait=${MIN_AGE_MIN}m | pause=${PAUSE_MS}ms`);
-  while (true) {
-    const client = await pool.connect();
-    try {
-      const cas = await selectNextToken(client);
-      client.release();
-
+  console.log(`enricher started | wait=${WAIT_MINUTES}m | pause=${PAUSE_MS}ms`);
+  const client = await pool.connect();
+  try {
+    while (true) {
+      const cas = await pickQueue(client);
       if (!cas.length) {
-        await sleep(PAUSE_MS);
+        await sleep(10_000);
         continue;
       }
-
       for (const ca of cas) {
-        await processOne(pool, ca);
+        await processOne(client, ca);
         await sleep(PAUSE_MS);
       }
-    } catch (e) {
-      client.release();
-      console.error('loop error:', e?.message || e);
-      await sleep(10_000);
     }
+  } finally {
+    client.release();
   }
 }
 
-loop().catch(e => {
-  console.error(e);
-  process.exit(1);
-});
+loop().catch(e => { console.error('fatal', e); process.exit(1); });
