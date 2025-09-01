@@ -7,9 +7,9 @@ import { Pool } from 'pg';
 
 // ---------- настройки ----------
 const DB_URL           = process.env.DATABASE_URL || process.env.NEON_DATABASE_URL;
-const PAUSE_MS         = 5000;       // пауза между токенами
+const PAUSE_MS         = 3000;       // пауза между токенами
 const WAIT_MINUTES     = 10;         // берём токены старше 10 минут
-const CANDLE_LIMIT     = 30;         // возьмём ~30 минут 1m-свечей (запас)
+const CANDLE_LIMIT     = 20;         // возьмём ~30 минут 1m-свечей (запас)
 const INTERVAL         = '1m';
 const CURRENCY         = 'USD';
 const RETRY_IN_MIN     = 15;         // при фолбэке повторить через 15 минут
