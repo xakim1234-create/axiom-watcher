@@ -2,12 +2,11 @@
   "name": "pfan-ws-catcher",
   "version": "1.0.0",
   "type": "module",
-  "main": "index.js",
   "scripts": {
-    "ws": "node index.js",
+    "start:ws": "node index.js",
+    "start:enrich": "node enrich.js",
     "enrich": "node enrich.js"
   },
-  "engines": { "node": "22.x" },
   "dependencies": {
     "dotenv": "^16.4.5",
     "node-fetch": "^3.3.2",
