@@ -5,3 +5,12 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
+    "ws": "node index.js",
+    "enrich": "node enrich.js"
+  },
+  "dependencies": {
+    "ws": "^8.17.0",
+    "pg": "^8.11.5",
+    "dotenv": "^16.4.5"
+  }
+}
