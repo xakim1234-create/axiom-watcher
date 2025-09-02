@@ -283,7 +283,7 @@ async function loop() {
     while (true) {
       const cas = await pickQueue(client);
       if (!cas.length) {
-        await sleep(10_000);
+        await sleep(50_000);
         continue;
       }
       for (const ca of cas) {
